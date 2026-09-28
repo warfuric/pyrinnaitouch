@@ -151,7 +151,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         self._writer: Optional[asyncio.StreamWriter] = None
         self._parser = FrameParser()
 
-        self._command_sequence: Optional[int] = None
+        self._last_sent_sequence: Optional[int] = None
         self._last_received_sequence = 0
         self._awaiting_ack: Optional[int] = None
         self._ack_event: Optional[asyncio.Event] = None
@@ -373,7 +373,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
 
         self._writer = writer
         self._parser.reset()
-        self._command_sequence = None  # adopted from the unit's first status
+        self._last_sent_sequence = None
         self._last_received_sequence = 0
         self._awaiting_ack = None
         self._ack_event.clear()
@@ -452,9 +452,6 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
     def _handle_frame(self, sequence: int, payload: bytes) -> None:
         self._last_frame_at = time.monotonic()
         self._last_received_sequence = sequence
-        if self._command_sequence is None:
-            # Continue from the unit's counter (it may still echo a previous session).
-            self._command_sequence = sequence
         # The unit echoes the sequence number of the last command it processed.
         if sequence == self._awaiting_ack:
             self._awaiting_ack = None
@@ -493,12 +490,26 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
             else:
                 await self._send_frame(writer, command.encode(), "command")
 
+    def _next_sequence(self) -> int:
+        """Pick a number the unit is not currently reporting and we have not just used.
+
+        Observed on a real unit: after hello it reports 0, then the last number it had
+        from the previous client, and it accepts any number we send. Choosing one past
+        what it currently reports keeps the echo unambiguous; skipping the number of an
+        unacknowledged command keeps a retry from looking like a repeat.
+        """
+        sequence = (self._last_received_sequence + 1) % _SEQUENCE_MODULUS
+        if sequence == self._last_sent_sequence:
+            sequence = (sequence + 1) % _SEQUENCE_MODULUS
+        return sequence
+
     async def _send_frame(self, writer: asyncio.StreamWriter, payload: bytes, label: str) -> None:
-        self._command_sequence = ((self._command_sequence or 0) + 1) % _SEQUENCE_MODULUS
-        _LOGGER.debug("Sending %s %d to %s", label, self._command_sequence, self._host)
+        sequence = self._next_sequence()
+        _LOGGER.debug("Sending %s %d to %s", label, sequence, self._host)
         self._ack_event.clear()
-        self._awaiting_ack = self._command_sequence
-        writer.write(b"N%06d" % self._command_sequence + payload)
+        self._awaiting_ack = sequence
+        self._last_sent_sequence = sequence
+        writer.write(b"N%06d" % sequence + payload)
         await writer.drain()
         self._last_send_at = time.monotonic()
         # Pace commands by the unit's acknowledgement; it copes badly with a pile-up.
@@ -506,9 +517,5 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
             async with asyncio.timeout(self._ack_timeout):
                 await self._ack_event.wait()
         except TimeoutError:
-            _LOGGER.debug(
-                "No acknowledgement of %d within %ss",
-                self._command_sequence,
-                self._ack_timeout,
-            )
+            _LOGGER.debug("No acknowledgement of %d within %ss", sequence, self._ack_timeout)
             self._awaiting_ack = None

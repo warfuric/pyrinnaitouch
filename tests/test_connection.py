@@ -333,7 +333,7 @@ async def test_alias_of_a_live_unit_is_refused(unit):
     await first.conn.stop()
 
 
-async def test_sequence_continues_from_the_units_counter_and_wraps(unit):
+async def test_sequence_is_one_past_the_units_report_and_wraps(unit):
     unit._last_sequence = 254  # pylint: disable=protected-access
     client = Client(unit)
     await client.conn.start()
@@ -343,6 +343,20 @@ async def test_sequence_continues_from_the_units_counter_and_wraps(unit):
     client.conn.send_command('{"b": 2}')
     await wait_for(lambda: len([c for c in unit.commands if c[1] != "NA"]) == 2)
     assert [seq for seq, payload in unit.commands if payload != "NA"] == [255, 0]
+    await client.conn.stop()
+
+
+async def test_unacknowledged_command_number_is_not_reused(unit):
+    unit.echo = False  # the unit keeps reporting the stale number 117
+    unit._last_sequence = 117  # pylint: disable=protected-access
+    client = Client(unit, ack_timeout=0.2)
+    await client.conn.start()
+    assert await client.conn.wait_connected(3)
+    await wait_for(lambda: client.statuses, what="first status")
+    client.conn.send_command('{"a": 1}')
+    client.conn.send_command('{"b": 2}')
+    await wait_for(lambda: len([c for c in unit.commands if c[1] != "NA"]) == 2)
+    assert [seq for seq, payload in unit.commands if payload != "NA"] == [118, 119]
     await client.conn.stop()
 
 
