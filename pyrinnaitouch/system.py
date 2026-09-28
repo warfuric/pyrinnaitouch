@@ -1,4 +1,4 @@
-﻿"""Main system control"""
+"""Main system control"""
 
 import logging
 import queue
@@ -89,12 +89,14 @@ class RinnaiSystem:
     @staticmethod
     def remove_instance(ip_address: str) -> None:
         """Remove an instance of the system defined by its IP address."""
-        if ip_address in RinnaiSystem.instances:
-            RinnaiSystem.instances[ip_address].shutdown()
-            del RinnaiSystem.instances[ip_address]
-            _LOGGER.debug("Removed instance for IP: %s", ip_address)
-        else:
+        # Drop the registration first so a failed shutdown can't leave a stale
+        # instance that blocks every later reload.
+        system = RinnaiSystem.instances.pop(ip_address, None)
+        if system is None:
             _LOGGER.warning("No instance found for IP: %s", ip_address)
+            return
+        system.shutdown()
+        _LOGGER.debug("Removed instance for IP: %s", ip_address)
 
     def subscribe_updates(self, obj_method: Any) -> None:
         """Subscribe to updates when the system status refreshes."""
@@ -111,25 +113,37 @@ class RinnaiSystem:
         # enter loop, wait for received (new) messages and push them to hass
         while True:
             new_status_json = self._receiverqueue.get()
-            if new_status_json:
-                if "sys.exit" in new_status_json:
+            if isinstance(new_status_json, str):
+                if new_status_json == "sys.exit":
                     break
-                if (
-                    isinstance(new_status_json, list)
-                    and "SYST" in new_status_json[0]
-                    and "STM" in new_status_json[0]["SYST"]
-                ):
-                    self._status.set_timesetting(True)
-                    self._on_updated()
-                else:
-                    status = RinnaiSystemStatus()
-                    res = status.handle_status(new_status_json)
-                    if res:
-                        self._status = status
-                        self._on_updated()
-                    else:
-                        _LOGGER.error("JSON Error: %s", new_status_json)
+                continue
+            if not new_status_json:
+                continue
+            # Nothing may end this thread: nobody restarts it.
+            try:
+                self._handle_status_message(new_status_json)
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Error handling a status update, skipping it")
         _LOGGER.debug("Shutting down the polling thread")
+
+    def _handle_status_message(self, new_status_json: Any) -> None:
+        """Turn one decoded status message into a status object and notify."""
+        if (
+            isinstance(new_status_json, list)
+            and isinstance(new_status_json[0], dict)
+            and "SYST" in new_status_json[0]
+            and "STM" in new_status_json[0]["SYST"]
+        ):
+            self._status.set_timesetting(True)
+            self._on_updated()
+            return
+
+        status = RinnaiSystemStatus()
+        if status.handle_status(new_status_json):
+            self._status = status
+            self._on_updated()
+        else:
+            _LOGGER.error("JSON Error: %s", new_status_json)
 
     async def set_cooling_mode(self) -> bool:
         """Set system to cooling mode."""
@@ -444,8 +458,13 @@ class RinnaiSystem:
         self._connection.start_thread()
         return self._status
 
-    def shutdown(self) -> None:
-        """Call this when removing the integration from home assistant."""
+    def shutdown(self, *_args: Any) -> None:
+        """Call this when removing the integration from home assistant.
+
+        Extra positional arguments are accepted and ignored so this can be
+        registered directly as a Home Assistant event listener, which passes the
+        Event through.
+        """
         try:
             self._connection.stop_thread()
             _LOGGER.debug("Connection thread stopped")

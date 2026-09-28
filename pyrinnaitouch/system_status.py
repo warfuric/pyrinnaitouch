@@ -116,10 +116,10 @@ class RinnaiSystemStatus():
 
             self.is_multi_set_point = y_n_to_bool(get_attribute(cfg, MULTI_SET_POINT, None))
             for zone in MAIN_ZONES:
-                self.zone_descriptions[zone] = get_attribute(cfg, "Z" + zone, None).strip()
+                self.zone_descriptions[zone] = get_attribute(cfg, "Z" + zone, "").strip()
 
-            self.firmware_version = get_attribute(cfg, FIRMWARE_VERSION, None).strip()
-            self.wifi_module_version = get_attribute(cfg, WIFI_MODULE_VERSION, None).strip()
+            self.firmware_version = get_attribute(cfg, FIRMWARE_VERSION, "").strip()
+            self.wifi_module_version = get_attribute(cfg, WIFI_MODULE_VERSION, "").strip()
 
     def set_fault(self, flt) -> None:
         """Parse and set fault state."""

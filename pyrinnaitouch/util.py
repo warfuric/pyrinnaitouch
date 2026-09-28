@@ -1,4 +1,4 @@
-﻿"""Utility functions"""
+"""Utility functions"""
 import threading
 from typing import Any, Callable
 from .const import RinnaiSchedulePeriod
@@ -30,7 +30,9 @@ def symbol_to_schedule_period(symbol: str) -> RinnaiSchedulePeriod:
 def daemonthreaded(function_arg: Callable) -> Callable:
     """Decoration to start object function as thread"""
     def wrapper(*args, **kwargs) -> threading.Thread:
-        thread = threading.Thread(target=function_arg, args=args, kwargs=kwargs)
+        thread = threading.Thread(
+            target=function_arg, args=args, kwargs=kwargs, name=function_arg.__qualname__
+        )
         thread.daemon = True
         thread.start()
         return thread
