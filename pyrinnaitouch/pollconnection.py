@@ -85,6 +85,15 @@ def _scan_json(buffer: bytes, start: int) -> Tuple[int, int]:
     return -1, next_header
 
 
+def _skip_whitespace(buffer: bytearray) -> None:
+    """Drop any leading whitespace in one slice, so a noisy peer is O(n) not O(n²)."""
+    skip = 0
+    while skip < len(buffer) and buffer[skip] in _WHITESPACE:
+        skip += 1
+    if skip:
+        del buffer[:skip]
+
+
 class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
     """Manage the non-blocking connection to the unit."""
 
@@ -476,11 +485,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         """
         buffer = self._readbuffer
         while True:
-            skip = 0
-            while skip < len(buffer) and buffer[skip] in _WHITESPACE:
-                skip += 1
-            if skip:
-                del buffer[:skip]
+            _skip_whitespace(buffer)
             if len(buffer) < _MIN_PARSE_LENGTH:
                 break
 
