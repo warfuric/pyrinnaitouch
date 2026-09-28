@@ -57,6 +57,7 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
         status: Optional[List[Any]] = None,
         status_interval: float = 0.2,
         broadcast_interval: float = 0.2,
+        idle_drop_seconds: Optional[float] = None,
     ) -> None:
         self.host = host
         self.tcp_port = tcp_port
@@ -64,6 +65,8 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
         self.status: List[Any] = status if status is not None else DEFAULT_STATUS
         self.status_interval = status_interval
         self.broadcast_interval = broadcast_interval
+        # The real module drops a session after a few minutes without traffic.
+        self.idle_drop_seconds = idle_drop_seconds
 
         self.send_status = True
         self.echo = True
@@ -117,6 +120,8 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
             writer.write(data)
 
     async def _broadcast(self) -> None:
+        # Unicast to the listener's port on loopback stands in for the real
+        # SO_BROADCAST datagram; multi-interface behaviour is not modelled.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.bind((self.host, 0))
             sock.setblocking(False)
@@ -138,7 +143,14 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
         try:
             buffer = b""
             while True:
-                data = await reader.read(4096)
+                if self.idle_drop_seconds is None:
+                    data = await reader.read(4096)
+                else:
+                    try:
+                        async with asyncio.timeout(self.idle_drop_seconds):
+                            data = await reader.read(4096)
+                    except TimeoutError:
+                        break  # silent client: the unit hangs up
                 if not data:
                     break
                 buffer += data

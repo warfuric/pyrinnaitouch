@@ -3,8 +3,15 @@
 One task owns the whole life of the link: wait for the unit's UDP broadcast, open the
 TCP session, read frames, pace commands by the unit's echo of their sequence number,
 send a keep-alive when idle, and reconnect on any failure. Everything is cancellable,
-so ``stop()`` returns immediately whatever the task is doing. All callbacks run on the
-event loop; nothing here touches a thread.
+so ``stop()`` returns immediately whatever the task is doing, and every callback runs
+on the event loop.
+
+Protocol summary (NBW2 API): the module accepts one TCP client on port 27847 and
+announces itself on UDP port 50000. On connect it sends ``*HELLO*``, then a status
+about once a second framed as ``N`` + six-digit sequence number + JSON array. A
+client sends ``N`` + six-digit sequence number + JSON command, or the same header
+followed by ``NA`` as a keep-alive; the module echoes the last sequence number it
+processed in its following status and drops a silent session after a few minutes.
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ import json
 import logging
 import socket
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from .framing import FrameOverflow, FrameParser
 
@@ -28,6 +35,7 @@ _BROADCAST_PREFIX = b"Rinnai_NBW2_Module"
 _SEQUENCE_MODULUS = 256
 # Cancellation is honoured at every await, so this only guards against a bug.
 _STOP_TIMEOUT = 10
+_CLOSE_TIMEOUT = 2
 
 StatusHandler = Callable[[Any], None]
 StateHandler = Callable[["RinnaiConnectionState"], None]
@@ -44,31 +52,18 @@ class RinnaiConnectionState(enum.Enum):
     ERROR = 6
 
 
-async def wait_or_timeout(awaitable: Any, timeout: Optional[float]) -> Tuple[bool, Any]:
-    """Await something with a timeout; returns ``(completed, result)``.
-
-    A replacement for ``asyncio.wait_for`` built on ``asyncio.wait``, which can never
-    lose our own cancellation (``wait_for`` could before Python 3.12, bpo-42130). The
-    inner task is cancelled on the way out, and the semantics are the same on every
-    supported version, so it is used everywhere here rather than only where it bites.
-    """
-    task = asyncio.ensure_future(awaitable)
-    try:
-        done, _ = await asyncio.wait({task}, timeout=timeout)
-    except asyncio.CancelledError:
-        task.cancel()
-        raise
-    if task in done:
-        return True, task.result()
-    task.cancel()
-    return False, None
-
-
 async def _finish(task: "asyncio.Task", timeout: Optional[float] = None) -> None:
-    """Wait for a subtask without raising its outcome; only our own cancellation raises."""
+    """Wait for a subtask we no longer need, without raising its outcome.
+
+    Awaiting a cancelled subtask directly raises its CancelledError, which cannot be
+    told apart from our own cancellation arriving at the same moment; swallowing that
+    would leave this task unstoppable. ``asyncio.wait`` reports the outcome instead.
+    """
     await asyncio.wait({task}, timeout=timeout)
     if task.done() and not task.cancelled():
-        task.exception()  # mark retrieved; the outcome is not interesting here
+        exc = task.exception()
+        if exc is not None:
+            _LOGGER.debug("Subtask %s ended with %r", task.get_name(), exc)
 
 
 class _BroadcastListener(asyncio.DatagramProtocol):
@@ -95,7 +90,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
     """Maintain the connection to one unit and deliver its status messages."""
 
     # Units in use, so two objects cannot fight over hardware that only takes one
-    # client. Keyed by IP address, holding the connection that started first.
+    # client. Keyed by the configured address, holding the connection that started.
     _active: Dict[str, "RinnaiConnection"] = {}
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -113,7 +108,8 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         ack_timeout: float = 5.0,
         watchdog_timeout: float = 30.0,
     ) -> None:
-        self._ip_address = ip_address
+        self._host = ip_address
+        self._resolved_ip = ip_address  # replaced by the resolved address on start
         self._on_status = on_status
         self._tcp_port = tcp_port
         self._udp_port = udp_port
@@ -173,50 +169,60 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         """Start maintaining the connection. Returns at once; idempotent."""
         if self.is_running:
             return
-        active = RinnaiConnection._active.get(self._ip_address)
+        active = RinnaiConnection._active.get(self._host)
         if active is not None and active is not self and active.is_running:
             _LOGGER.error(
                 "Attempting duplicate connection to unit at %s, which the hardware "
                 "will not support",
-                self._ip_address,
+                self._host,
             )
             raise RuntimeError("Cannot have two connections to the same address")
-        RinnaiConnection._active[self._ip_address] = self
+        RinnaiConnection._active[self._host] = self
         self._connected_event = asyncio.Event()
         self._commands = asyncio.Queue()
         self._ack_event = asyncio.Event()
         self._task = asyncio.get_running_loop().create_task(
-            self._run(), name=f"RinnaiConnection({self._ip_address})"
+            self._run(), name=f"RinnaiConnection({self._host})"
         )
 
     async def stop(self) -> None:
-        """Close the connection and stop reconnecting. Idempotent."""
+        """Close the connection and stop reconnecting. Idempotent.
+
+        The bookkeeping runs even if the caller is cancelled while waiting.
+        """
         task, self._task = self._task, None
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.wait({task}, timeout=_STOP_TIMEOUT)
-            if not task.done():
-                _LOGGER.error(
-                    "Connection task for %s ignored cancellation for %ss; abandoning it",
-                    self._ip_address,
-                    _STOP_TIMEOUT,
-                )
-            elif not task.cancelled() and task.exception() is not None:
-                _LOGGER.error(
-                    "Connection task for %s ended with an error",
-                    self._ip_address,
-                    exc_info=task.exception(),
-                )
-        if RinnaiConnection._active.get(self._ip_address) is self:
-            del RinnaiConnection._active[self._ip_address]
-        self._set_state(RinnaiConnectionState.IDLE)
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.wait({task}, timeout=_STOP_TIMEOUT)
+                if not task.done():
+                    _LOGGER.error(
+                        "Connection task for %s ignored cancellation for %ss; "
+                        "abandoning it",
+                        self._host,
+                        _STOP_TIMEOUT,
+                    )
+                elif not task.cancelled() and task.exception() is not None:
+                    _LOGGER.error(
+                        "Connection task for %s ended with an error",
+                        self._host,
+                        exc_info=task.exception(),
+                    )
+        finally:
+            if RinnaiConnection._active.get(self._host) is self:
+                del RinnaiConnection._active[self._host]
+            self._set_state(RinnaiConnectionState.IDLE)
 
     async def wait_connected(self, timeout: float) -> bool:
         """Wait up to ``timeout`` seconds for the session to come up."""
         if self._connected_event is None:
             return False
-        completed, _ = await wait_or_timeout(self._connected_event.wait(), timeout)
-        return completed
+        try:
+            async with asyncio.timeout(timeout):
+                await self._connected_event.wait()
+        except TimeoutError:
+            return False
+        return True
 
     def send_command(self, command: str) -> None:
         """Queue a command string for the unit. Sent in order, one at a time."""
@@ -231,7 +237,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         if state is self._state:
             return
         self._state = state
-        _LOGGER.debug("Connection to %s is now %s", self._ip_address, state.name)
+        _LOGGER.debug("Connection to %s is now %s", self._host, state.name)
         if self._connected_event is not None:
             if state is RinnaiConnectionState.CONNECTED:
                 self._connected_event.set()
@@ -250,22 +256,41 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
     # ----------------------------------------------------------------- main task
 
     async def _run(self) -> None:
+        await self._resolve_host()
         while True:
+            # One funnel: every outcome except a clean peer close (IDLE, which goes
+            # back through discovery) waits retry_delay before the next attempt.
             try:
                 if self._state is RinnaiConnectionState.IDLE:
                     await self._wait_for_broadcast()
-                await self._session()
+                next_state = await self._session()
             except Exception:  # pylint: disable=broad-exception-caught
                 # CancelledError is a BaseException, so stop() still gets through.
-                _LOGGER.exception("Unexpected error on the connection to %s", self._ip_address)
-                self._set_state(RinnaiConnectionState.ERROR)
+                _LOGGER.exception("Unexpected error on the connection to %s", self._host)
+                next_state = RinnaiConnectionState.ERROR
+            self._set_state(next_state)
+            if next_state is not RinnaiConnectionState.IDLE:
                 await asyncio.sleep(self._retry_delay)
+
+    async def _resolve_host(self) -> None:
+        """Resolve a hostname once so broadcasts can be matched by source address."""
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                self._host, None, family=socket.AF_INET, type=socket.SOCK_STREAM
+            )
+        except OSError as err:
+            _LOGGER.warning("Could not resolve %s (%s); using it as given", self._host, err)
+            return
+        if infos:
+            self._resolved_ip = infos[0][4][0]
 
     async def _wait_for_broadcast(self) -> None:
         """Block until the unit announces itself, or fall back to a direct connect."""
         loop = asyncio.get_running_loop()
-        listener = _BroadcastListener(self._ip_address)
+        listener = _BroadcastListener(self._resolved_ip)
         try:
+            # SO_REUSEADDR lets several connections (one per unit) share the port; on
+            # Linux each bound socket receives every broadcast.
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.setblocking(False)
@@ -282,55 +307,50 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         try:
             while attempts < self._udp_fallback_attempts:
                 listener.found = loop.create_future()
-                found, _ = await wait_or_timeout(listener.found, self._udp_timeout)
-                if found:
-                    self._set_state(RinnaiConnectionState.CONNECTING)
-                    return
-                # A timeout, or packets from some other unit: both count, or discovery
-                # could wait forever on a network with two units.
-                attempts += 1 + listener.foreign
-                listener.foreign = 0
-                _LOGGER.debug(
-                    "No broadcast from %s yet (%d/%d)",
-                    self._ip_address, attempts, self._udp_fallback_attempts,
-                )
+                try:
+                    async with asyncio.timeout(self._udp_timeout):
+                        await listener.found
+                except TimeoutError:
+                    # A timeout, or packets from some other unit: both count, or
+                    # discovery could wait forever on a network with two units.
+                    attempts += 1 + listener.foreign
+                    listener.foreign = 0
+                    _LOGGER.debug(
+                        "No broadcast from %s yet (%d/%d)",
+                        self._host, attempts, self._udp_fallback_attempts,
+                    )
+                    continue
+                self._set_state(RinnaiConnectionState.CONNECTING)
+                return
             _LOGGER.warning(
                 "No broadcast from %s after %d timeouts or foreign packets, "
                 "connecting directly",
-                self._ip_address,
+                self._host,
                 attempts,
             )
             self._set_state(RinnaiConnectionState.CONNECTING)
         finally:
             transport.close()
 
-    async def _session(self) -> None:
-        """Open the TCP session and run it until it fails; sets the next state."""
+    async def _session(self) -> RinnaiConnectionState:
+        """Open the TCP session and run it until it fails; returns the next state."""
         try:
-            connected, streams = await wait_or_timeout(
-                asyncio.open_connection(
-                    self._ip_address, self._tcp_port or DEFAULT_TCP_PORT
-                ),
-                self._connect_timeout,
-            )
-            if not connected:
-                self._set_state(RinnaiConnectionState.TIMEOUT)
-                await asyncio.sleep(self._retry_delay)
-                return
-            reader, writer = streams
+            async with asyncio.timeout(self._connect_timeout):
+                reader, writer = await asyncio.open_connection(
+                    self._host, self._tcp_port or DEFAULT_TCP_PORT
+                )
         except ConnectionRefusedError:
-            self._set_state(RinnaiConnectionState.REFUSED)
-            await asyncio.sleep(self._retry_delay)
-            return
+            return RinnaiConnectionState.REFUSED
+        except TimeoutError:
+            return RinnaiConnectionState.TIMEOUT
         except OSError as err:
-            _LOGGER.warning("Could not connect to %s: %s", self._ip_address, err)
-            self._set_state(RinnaiConnectionState.ERROR)
-            await asyncio.sleep(self._retry_delay)
-            return
+            _LOGGER.warning("Could not connect to %s: %s", self._host, err)
+            return RinnaiConnectionState.ERROR
 
         self._writer = writer
         self._parser.reset()
         self._command_sequence = 1
+        self._last_received_sequence = 0
         self._awaiting_ack = None
         self._ack_event.clear()
         self._last_frame_at = time.monotonic()
@@ -338,20 +358,31 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         self._set_state(RinnaiConnectionState.CONNECTED)
 
         loop = asyncio.get_running_loop()
-        sender = loop.create_task(self._send_loop(writer))
+        receiver = loop.create_task(self._receive_loop(reader), name="rinnai-receive")
+        sender = loop.create_task(self._send_loop(writer), name="rinnai-send")
         next_state = RinnaiConnectionState.IDLE
         try:
-            next_state = await self._receive_loop(reader)
+            # The session ends when either side ends: a dead sender must not leave a
+            # session that looks connected but can no longer send anything.
+            await asyncio.wait({receiver, sender}, return_when=asyncio.FIRST_COMPLETED)
+            if receiver.done():
+                next_state = receiver.result()
+            elif not sender.cancelled() and sender.exception() is not None:
+                _LOGGER.warning(
+                    "Sending to %s failed: %r. Reconnecting", self._host, sender.exception()
+                )
         finally:
-            # Never `await sender` here: it raises the sender's CancelledError, which
-            # is indistinguishable from our own cancellation arriving at the same
-            # moment, and swallowing that would leave the task unstoppable.
-            sender.cancel()
-            await _finish(sender)
-            self._writer = None
-            writer.close()
-            await _finish(loop.create_task(writer.wait_closed()), timeout=2)
-            self._set_state(next_state)
+            try:
+                receiver.cancel()
+                sender.cancel()
+                await _finish(receiver, _CLOSE_TIMEOUT)
+                await _finish(sender, _CLOSE_TIMEOUT)
+            finally:
+                # A second cancellation cannot skip this: close() is synchronous.
+                self._writer = None
+                writer.close()
+                await _finish(loop.create_task(writer.wait_closed()), _CLOSE_TIMEOUT)
+        return next_state
 
     async def _receive_loop(self, reader: asyncio.StreamReader) -> RinnaiConnectionState:
         """Read frames until the link drops; returns the state to enter next."""
@@ -362,7 +393,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
                 if remaining <= 0:
                     _LOGGER.warning(
                         "No status from %s for %d seconds, reconnecting",
-                        self._ip_address, self._watchdog_timeout,
+                        self._host, self._watchdog_timeout,
                     )
                     return RinnaiConnectionState.TIMEOUT
                 done, _ = await asyncio.wait({read}, timeout=remaining)
@@ -371,14 +402,10 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
                 try:
                     data = read.result()
                 except OSError as err:
-                    _LOGGER.warning(
-                        "Read from %s failed: %s. Reconnecting", self._ip_address, err
-                    )
+                    _LOGGER.warning("Read from %s failed: %s. Reconnecting", self._host, err)
                     return RinnaiConnectionState.IDLE
                 if not data:
-                    _LOGGER.info(
-                        "Unit at %s closed the connection. Reconnecting", self._ip_address
-                    )
+                    _LOGGER.info("Unit at %s closed the connection. Reconnecting", self._host)
                     return RinnaiConnectionState.IDLE
                 read = asyncio.ensure_future(reader.read(8192))
 
@@ -386,7 +413,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
                 try:
                     frames = self._parser.feed(data)
                 except FrameOverflow as err:
-                    _LOGGER.error("%s from %s; reconnecting", err, self._ip_address)
+                    _LOGGER.error("%s from %s; reconnecting", err, self._host)
                     return RinnaiConnectionState.ERROR
                 if self._parser.hellos != hellos_before:
                     self._last_frame_at = time.monotonic()
@@ -394,6 +421,7 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
                     self._handle_frame(sequence, payload)
         finally:
             read.cancel()
+            await _finish(read, _CLOSE_TIMEOUT)
 
     def _handle_frame(self, sequence: int, payload: bytes) -> None:
         self._last_frame_at = time.monotonic()
@@ -426,7 +454,11 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
                 command = None
                 wait = self._keepalive_interval - (time.monotonic() - self._last_send_at)
                 if wait > 0:
-                    _, command = await wait_or_timeout(self._commands.get(), wait)
+                    try:
+                        async with asyncio.timeout(wait):
+                            command = await self._commands.get()
+                    except TimeoutError:
+                        command = None
             if command is None:
                 await self._send_frame(writer, b"NA", "idle command")
             else:
@@ -436,15 +468,17 @@ class RinnaiConnection:  # pylint: disable=too-many-instance-attributes
         self._command_sequence = max(
             self._command_sequence + 1, self._last_received_sequence + 1
         ) % _SEQUENCE_MODULUS
-        _LOGGER.debug("Sending %s %d to %s", label, self._command_sequence, self._ip_address)
+        _LOGGER.debug("Sending %s %d to %s", label, self._command_sequence, self._host)
         self._ack_event.clear()
         self._awaiting_ack = self._command_sequence
         writer.write(b"N%06d" % self._command_sequence + payload)
         await writer.drain()
         self._last_send_at = time.monotonic()
         # Pace commands by the unit's acknowledgement; it copes badly with a pile-up.
-        acknowledged, _ = await wait_or_timeout(self._ack_event.wait(), self._ack_timeout)
-        if not acknowledged:
+        try:
+            async with asyncio.timeout(self._ack_timeout):
+                await self._ack_event.wait()
+        except TimeoutError:
             _LOGGER.debug(
                 "No acknowledgement of %d within %ss",
                 self._command_sequence,

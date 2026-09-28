@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from .const import RinnaiSystemMode, RinnaiUnitId
-from .connection import RinnaiConnection, RinnaiConnectionState, wait_or_timeout
+from .connection import RinnaiConnection, RinnaiConnectionState
 from .event import Event
 from .system_status import RinnaiSystemStatus
 from .commands import (
@@ -114,8 +114,12 @@ class RinnaiSystem:
             return True
         if self._status_event is None:
             return False
-        ready, _ = await wait_or_timeout(self._status_event.wait(), timeout)
-        return ready
+        try:
+            async with asyncio.timeout(timeout):
+                await self._status_event.wait()
+        except TimeoutError:
+            return False
+        return True
 
     @property
     def is_connected(self) -> bool:

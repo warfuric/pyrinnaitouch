@@ -267,3 +267,53 @@ async def test_status_handler_exception_is_isolated(unit, caplog):
     await wait_for(lambda: len(calls) >= 2)  # still delivering after the first failure
     assert "Status handler failed" in caplog.text
     await conn.stop()
+
+
+async def test_sender_failure_ends_the_session_and_reconnects(unit):
+    """A dead sender must not leave a session that looks connected but cannot send."""
+    client = Client(unit)
+    await client.conn.start()
+    assert await client.conn.wait_connected(3)
+
+    def broken_write(_data):
+        raise BrokenPipeError("half-closed link")
+
+    client.conn._writer.write = broken_write  # pylint: disable=protected-access
+    client.conn.send_command('{"a": 1}')
+    await wait_for(lambda: unit.connections == 2 and client.conn.is_connected, what="reconnect")
+    client.conn.send_command('{"b": 2}')
+    await wait_for(lambda: any(payload == '{"b": 2}' for _, payload in unit.commands))
+    await client.conn.stop()
+
+
+async def test_backoff_applies_after_a_watchdog_timeout(unit):
+    client = Client(unit, watchdog_timeout=0.3, retry_delay=0.6)
+    await client.conn.start()
+    assert await client.conn.wait_connected(3)
+    unit.send_status = False
+    await wait_for(lambda: RinnaiConnectionState.TIMEOUT in client.states, what="watchdog")
+    timed_out_at = time.monotonic()
+    unit.send_status = True
+    await wait_for(lambda: unit.connections == 2, what="reconnect")
+    assert time.monotonic() - timed_out_at >= 0.5  # waited retry_delay, no tight loop
+    await client.conn.stop()
+
+
+async def test_keepalive_prevents_the_units_idle_drop():
+    unit = await FakeRinnaiUnit(udp_port=free_udp_port(), status_interval=0.1,
+                                broadcast_interval=0.1, idle_drop_seconds=0.5).start()
+    try:
+        client = Client(unit, keepalive_interval=0.15)
+        await client.conn.start()
+        assert await client.conn.wait_connected(3)
+        await asyncio.sleep(1.5)
+        assert unit.connections == 1 and client.conn.is_connected
+        await client.conn.stop()
+
+        silent = Client(unit, keepalive_interval=5)
+        await silent.conn.start()
+        assert await silent.conn.wait_connected(3)
+        await wait_for(lambda: unit.connections >= 3, what="unit hung up on the silent client")
+        await silent.conn.stop()
+    finally:
+        await unit.stop()
