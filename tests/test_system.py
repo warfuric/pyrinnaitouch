@@ -1,5 +1,6 @@
 """Tests for RinnaiSystem lifecycle and the Event helper."""
 
+import json
 import time
 from queue import SimpleQueue
 
@@ -9,8 +10,6 @@ from pyrinnaitouch.event import Event
 from pyrinnaitouch.pollconnection import RinnaiPollConnection
 from pyrinnaitouch.system import RinnaiSystem
 from tests.test_pollconnection import STATUS
-
-import json
 
 
 @pytest.fixture(autouse=True)

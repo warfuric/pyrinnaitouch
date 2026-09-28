@@ -10,6 +10,7 @@ import selectors
 import socket
 import threading
 import time
+from typing import Tuple
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,13 +18,20 @@ _LOGGER = logging.getLogger(__name__)
 _MESSAGE_HEADER = re.compile(rb"N(\d{6})\[")
 _HEADER_PREFIX = re.compile(rb"N\d{0,6}")
 _HELLO = b"*HELLO*"
+_BROADCAST_PREFIX = b"Rinnai_NBW2_Module"
+_WHITESPACE = frozenset(b" \r\n\t")
 # Shortest buffer worth parsing: a full hello, or a header minus its opening bracket.
 _MIN_PARSE_LENGTH = 7
 # A single status is a couple of kilobytes. Anything larger with no complete message in it
 # is not going to parse, no matter how long we wait.
 _MAX_BUFFER_BYTES = 64 * 1024
+# The unit sends a status roughly every second; silence this long means the session is gone.
 _NO_DATA_TIMEOUT_SECONDS = 30
+# Sequence numbers are 0..255 (NBW2 API 4.1) and the unit echoes ours back.
+_SEQUENCE_MODULUS = 256
 _STOP_JOIN_SECONDS = 15
+# socket.timeout only became an alias of TimeoutError in Python 3.10.
+_TIMEOUT_ERRORS = (TimeoutError, socket.timeout)
 
 
 class RinnaiConnectionState(enum.Enum):
@@ -37,15 +45,19 @@ class RinnaiConnectionState(enum.Enum):
     ERROR = 6
 
 
-def _find_json_end(buffer: bytes, start: int) -> int:
-    """Return the index of the bracket that closes the JSON value opening at ``start``.
+def _scan_json(buffer: bytes, start: int) -> Tuple[int, int]:
+    """Scan the JSON value that opens at ``start``.
 
-    Returns -1 while the value is incomplete. Brackets inside JSON strings are ignored so
-    a zone name containing "]" cannot truncate a message.
+    Returns ``(end, next_header)``: ``end`` is the index of the bracket that closes the
+    value, or -1 while it is incomplete; ``next_header`` is the index of the first
+    message header found *outside a string* after ``start``, or -1. A header outside a
+    string can never be part of valid JSON, so it proves the current message was cut
+    short and the unit has moved on to the next one.
     """
     depth = 0
     in_string = False
     escaped = False
+    next_header = -1
     for index in range(start, len(buffer)):
         byte = buffer[index]
         if in_string:
@@ -62,8 +74,15 @@ def _find_json_end(buffer: bytes, start: int) -> int:
         elif byte in (0x5D, 0x7D):  # ] or }
             depth -= 1
             if depth <= 0:
-                return index
-    return -1
+                return index, -1
+        elif (
+            byte == 0x4E  # N
+            and next_header < 0
+            and index > start
+            and _MESSAGE_HEADER.match(buffer, index)
+        ):
+            next_header = index
+    return -1, next_header
 
 
 class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
@@ -72,6 +91,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
     # Global map of IP addresses currently in use. Only used to track when multiple
     # connections are attempted, since we know how poorly the hardware handles this.
     clients = defaultdict(int)
+    _clients_lock = threading.Lock()
 
     def __init__(
         self,
@@ -84,63 +104,80 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         """Initialise the connection object."""
         # Set first so __del__ and stop_thread are safe on a half-built object.
         self._stopped = True
-
-        if RinnaiPollConnection.clients[ip_address] > 0:
-            _LOGGER.error(
-                "Attempting duplicate connection to unit at %s, which the hardware "
-                "will not support",
-                ip_address,
-            )
-            raise RuntimeError("Cannot have two connections to the same address")
-        RinnaiPollConnection.clients[ip_address] += 1
-
+        self._stop_lock = threading.Lock()
         self._ip_address = ip_address
-        self._port = tcp_port
-        self._command_sequence = 1
-        self._last_command_time = 0
-        self._last_received_time = 0
-        self._command_timeout_seconds = 10
-        self._hello_received = False
-        self._last_received_sequence_num = 0
-        self._command_wait = False
-        self._command_wait_timeout_seconds = 5
-        self._udp_address = "0.0.0.0"
-        self._udp_port = udp_port
-        self._udp_timeout_seconds = 5
-        # Try TCP directly after this many discovery timeouts (~30 s of no broadcast).
-        self._udp_fallback_attempts = 6
-        self._select_timeout_seconds = 1.0
 
-        # Queue of commands (each as a string) to send to the unit.
-        self._sendqueue = SimpleQueue()
+        with RinnaiPollConnection._clients_lock:
+            if RinnaiPollConnection.clients[ip_address] > 0:
+                _LOGGER.error(
+                    "Attempting duplicate connection to unit at %s, which the hardware "
+                    "will not support",
+                    ip_address,
+                )
+                raise RuntimeError("Cannot have two connections to the same address")
+            RinnaiPollConnection.clients[ip_address] += 1
 
-        # Set on shutdown only. The event makes every wait in the thread interruptible.
-        self._thread_exit_flag = False
-        self._exit_event = threading.Event()
+        try:
+            self._port = tcp_port
+            self._command_sequence = 1
+            self._last_command_time = 0.0
+            self._last_received_time = 0.0
+            self._command_timeout_seconds = 10
+            self._hello_received = False
+            self._last_received_sequence_num = 0
+            self._command_wait = False
+            self._command_wait_timeout_seconds = 5
+            self._udp_address = "0.0.0.0"
+            self._udp_port = udp_port
+            self._udp_timeout_seconds = 5
+            # Try TCP directly after this many timeouts or foreign packets (~30 s).
+            self._udp_fallback_attempts = 6
+            self._select_timeout_seconds = 1.0
 
-        # Writing to the sender wakes the selector immediately, so the thread does not
-        # have to poll the command queue on a short timer.
-        self._wake_receiver, self._wake_sender = socket.socketpair()
-        self._wake_receiver.setblocking(False)
-        self._wake_sender.setblocking(False)
+            # Queue of commands (each as a string) to send to the unit.
+            self._sendqueue = SimpleQueue()
 
-        # These don't get created until start_thread is called
-        self._socket: socket.socket = None
-        self._socketthread: threading.Thread = None
-        self._socketstate = RinnaiConnectionState.IDLE
+            # Set on shutdown only. The event makes every wait interruptible.
+            self._thread_exit_flag = False
+            self._exit_event = threading.Event()
 
-        self._readbuffer = bytearray()
-        self._writebuffer = bytearray()
+            # Writing to the sender wakes the selector immediately, so the thread
+            # does not have to poll the command queue on a short timer.
+            self._wake_receiver, self._wake_sender = socket.socketpair()
+            self._wake_receiver.setblocking(False)
+            self._wake_sender.setblocking(False)
 
-        # List of functions to call whenever _socketstate changes
-        # Provides a single argument, RinnaiConnectionState
-        self._connection_state_handlers = []
+            # These don't get created until start_thread is called
+            self._socket: socket.socket = None
+            self._socketthread: threading.Thread = None
+            self._socketstate = RinnaiConnectionState.IDLE
 
-        # Outbound queue of JSON status
-        self._status_queue = status_queue
+            self._readbuffer = bytearray()
+            self._writebuffer = bytearray()
 
+            # List of functions to call whenever _socketstate changes
+            # Provides a single argument, RinnaiConnectionState
+            self._connection_state_handlers = []
+
+            # Outbound queue of JSON status
+            self._status_queue = status_queue
+        except BaseException:  # pylint: disable=broad-exception-caught
+            # Whatever went wrong, the slot must not stay taken for the process lifetime.
+            self._release_client_slot()
+            raise
         self._stopped = False
         _LOGGER.debug("Poll connection inited")
+
+    def _release_client_slot(self) -> None:
+        with RinnaiPollConnection._clients_lock:
+            RinnaiPollConnection.clients[self._ip_address] -= 1
+            if RinnaiPollConnection.clients[self._ip_address] < 0:
+                _LOGGER.error(
+                    "Somehow we have a negative number of connections; something has "
+                    "gone very wrong"
+                )
+                # Try to restore some sanity
+                RinnaiPollConnection.clients[self._ip_address] = 0
 
     def send_command(self, command: str) -> None:
         """Queue a command to be sent to the unit."""
@@ -159,48 +196,42 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         so if it somehow fails to stop in time it is abandoned rather than blocking
         interpreter exit.
         """
-        if self._stopped:
-            return
-        self._stopped = True
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
 
-        self._thread_exit_flag = True
-        self._exit_event.set()
-        self._wake()
+        try:
+            self._thread_exit_flag = True
+            self._exit_event.set()
+            self._wake()
 
-        thread = self._socketthread
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(_STOP_JOIN_SECONDS)
-            if thread.is_alive():
-                _LOGGER.error(
-                    "Monitoring thread did not stop within %d seconds; abandoning it",
-                    _STOP_JOIN_SECONDS,
-                )
-            else:
-                _LOGGER.debug("Monitoring thread confirmed stopped")
-        self._socketthread = None
+            thread = self._socketthread
+            if (
+                thread is not None
+                and thread.is_alive()
+                and thread is not threading.current_thread()
+            ):
+                thread.join(_STOP_JOIN_SECONDS)
+                if thread.is_alive():
+                    _LOGGER.error(
+                        "Monitoring thread did not stop within %d seconds; abandoning it",
+                        _STOP_JOIN_SECONDS,
+                    )
+                else:
+                    _LOGGER.debug("Monitoring thread confirmed stopped")
+            self._socketthread = None
 
-        self._close_socket()
-        for wake_socket in (self._wake_receiver, self._wake_sender):
-            try:
-                wake_socket.close()
-            except OSError:
-                pass
-
-        # Let anybody listening to the status know that we're exiting.
-        self._status_queue.put("sys.exit")
-
-        RinnaiPollConnection.clients[self._ip_address] -= 1
-        if RinnaiPollConnection.clients[self._ip_address] < 0:
-            _LOGGER.error(
-                "Somehow we have a negative number of connections; something has "
-                "gone very wrong"
-            )
-            # Try to restore some sanity
-            RinnaiPollConnection.clients[self._ip_address] = 0
+            self._close_socket()
+            for wake_socket in (self._wake_receiver, self._wake_sender):
+                try:
+                    wake_socket.close()
+                except OSError:
+                    pass
+        finally:
+            # Let anybody listening to the status know that we're exiting.
+            self._status_queue.put("sys.exit")
+            self._release_client_slot()
 
     def _wake(self) -> None:
         """Interrupt the selector so the thread notices queued commands or shutdown."""
@@ -255,18 +286,17 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
     def register_socket_state_handler(self, handler) -> None:
         """Register a new handler interested in socket state updates.
 
-        The new handler immediately gets called with the current status, and if
-        successfully executed is added to the handler list. Duplicate handlers are
-        ignored.
+        The handler is called immediately with the current state and on every change
+        after that. A failure in the handler is logged, never raised into the caller.
+        Duplicate handlers are ignored.
         """
-        if handler not in self._connection_state_handlers:
-            try:
-                handler(self._socketstate)
-                self._connection_state_handlers.append(handler)
-            except TypeError as te:
-                _LOGGER.error(
-                    "Registration failed - could not call socket handler: %s", te
-                )
+        if handler in self._connection_state_handlers:
+            return
+        self._connection_state_handlers.append(handler)
+        try:
+            handler(self._socketstate)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _LOGGER.exception("Socket state handler %r failed", handler)
 
     def unregister_socket_state_handler(self, handler) -> None:
         """Unregister a socket state handler."""
@@ -341,26 +371,24 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                         self._attempt_send()
 
                 self._service_send_queue()
+                self._process_received_data()
 
                 if (
-                    time.time() - self._last_received_time
+                    time.monotonic() - self._last_received_time
                     > _NO_DATA_TIMEOUT_SECONDS
                 ):
-                    _LOGGER.error(
-                        "Resetting connection as no data received for at least %d "
-                        "seconds",
+                    _LOGGER.warning(
+                        "No status received from the unit for %d seconds, reconnecting",
                         _NO_DATA_TIMEOUT_SECONDS,
                     )
                     self._update_socket_state(RinnaiConnectionState.TIMEOUT)
-
-                self._process_received_data()
 
     def _receive(self) -> None:
         """Read whatever is available on the socket into the receive buffer."""
         try:
             newbytes = self._socket.recv(8192)
         except OSError as ose:
-            _LOGGER.error("Socket error on recv: %s. Reconnecting", ose)
+            _LOGGER.warning("Socket error on recv: %s. Reconnecting", ose)
             self._update_socket_state(RinnaiConnectionState.IDLE)
             return
 
@@ -370,7 +398,6 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
             self._update_socket_state(RinnaiConnectionState.IDLE)
             return
 
-        self._last_received_time = time.time()
         self._readbuffer.extend(newbytes)
         _LOGGER.debug(
             "Read %d bytes from socket, receive buffer now has %d bytes to process",
@@ -385,7 +412,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         """
         while not self._thread_exit_flag:
             if self._command_wait and (
-                (time.time() - self._last_command_time)
+                (time.monotonic() - self._last_command_time)
                 < self._command_wait_timeout_seconds
             ):
                 # The unit has not acknowledged the previous command yet.
@@ -396,7 +423,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                 # Nothing in the queue for now. Send an empty command if it's been
                 # long enough, so the unit knows we're still here.
                 if (
-                    time.time() - self._last_command_time
+                    time.monotonic() - self._last_command_time
                     > self._command_timeout_seconds
                 ):
                     self._queue_frame(b"NA", "idle command")
@@ -408,7 +435,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         self._command_sequence = max(
             self._command_sequence + 1, self._last_received_sequence_num + 1
         )
-        self._command_sequence %= 255
+        self._command_sequence %= _SEQUENCE_MODULUS
         header = b"N%06d" % self._command_sequence
         self._writebuffer.extend(header)
         self._writebuffer.extend(payload)
@@ -417,7 +444,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
 
         # Update the time here in case the socket doesn't become write available
         # quickly, so we don't queue the same keep-alive again next loop.
-        self._last_command_time = time.time()
+        self._last_command_time = time.monotonic()
         self._command_wait = True
 
     def _attempt_send(self) -> None:
@@ -429,7 +456,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
             _LOGGER.debug("Sent %d of %d bytes", num_sent, len(self._writebuffer))
             del self._writebuffer[:num_sent]
 
-            self._last_command_time = time.time()
+            self._last_command_time = time.monotonic()
             if len(self._writebuffer) > 0:
                 _LOGGER.warning(
                     "There are %d bytes remaining to send. There may be network "
@@ -437,18 +464,26 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                     len(self._writebuffer),
                 )
         except OSError as ose:
-            _LOGGER.error("Socket error on send: %s. Reconnecting", ose)
+            _LOGGER.warning("Socket error on send: %s. Reconnecting", ose)
             self._update_socket_state(RinnaiConnectionState.IDLE)
 
     def _process_received_data(self) -> None:
         """Parse every complete message in the receive buffer.
 
         Works on bytes throughout, so a packet boundary in the middle of a multi-byte
-        character cannot raise. Always either consumes bytes, waits for more, or
+        character cannot raise. Every pass either consumes bytes, waits for more, or
         resets the connection, so it cannot spin on the same data.
         """
         buffer = self._readbuffer
-        while len(buffer) >= _MIN_PARSE_LENGTH:
+        while True:
+            skip = 0
+            while skip < len(buffer) and buffer[skip] in _WHITESPACE:
+                skip += 1
+            if skip:
+                del buffer[:skip]
+            if len(buffer) < _MIN_PARSE_LENGTH:
+                break
+
             if buffer.startswith(_HELLO):
                 if self._hello_received:
                     _LOGGER.warning(
@@ -457,6 +492,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                 else:
                     _LOGGER.info("Hello message successfully received from unit")
                     self._hello_received = True
+                self._last_received_time = time.monotonic()
                 del buffer[: len(_HELLO)]
                 continue
 
@@ -470,16 +506,15 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                 continue
 
             json_start = header.end() - 1
-            json_end = _find_json_end(buffer, json_start)
+            json_end, next_header = _scan_json(buffer, json_start)
             if json_end < 0:
                 # Message is incomplete (partial TCP packet). If the unit has already
                 # started a new message, the tail of this one is never coming.
-                following = _MESSAGE_HEADER.search(buffer, header.end())
-                if following is not None:
+                if next_header > 0:
                     _LOGGER.warning(
-                        "Discarding %d bytes of truncated message", following.start()
+                        "Discarding %d bytes of truncated message", next_header
                     )
-                    del buffer[: following.start()]
+                    del buffer[:next_header]
                     continue
                 if len(buffer) > _MAX_BUFFER_BYTES:
                     _LOGGER.error(
@@ -519,8 +554,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
 
         # Keep a tail that could still turn out to be the start of a header or hello
         # once the next packet arrives.
-        keep = _MIN_PARSE_LENGTH
-        discard = len(buffer) - keep
+        discard = len(buffer) - _MIN_PARSE_LENGTH
         if discard > 0:
             _LOGGER.warning("Discarding %d unparseable bytes", discard)
             _LOGGER.debug("Discarded %r", bytes(buffer[:discard]))
@@ -529,9 +563,11 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
 
     def _handle_message(self, sequence: int, payload: bytes) -> None:
         """Record a message's sequence number and queue its status for the consumer."""
+        self._last_received_time = time.monotonic()
         self._last_received_sequence_num = sequence
         _LOGGER.debug("Received sequence number %d", sequence)
-        if self._command_wait and sequence >= self._command_sequence:
+        # The unit echoes the sequence number of the last command it processed.
+        if self._command_wait and sequence == self._command_sequence:
             self._command_wait = False
             _LOGGER.debug("Command wait end")
 
@@ -544,50 +580,68 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
         self._status_queue.put(json_status)
 
     def _wait_for_broadcast(self) -> None:
-        """Wait for the unit's UDP broadcast before connecting, falling back to a
-        direct TCP attempt if none arrives."""
-        udp_timeout_count = 0
-        rinnai_broadcast_string = b"Rinnai_NBW2_Module"
+        """Wait for the unit's UDP broadcast before connecting.
 
-        while (
-            self._socketstate == RinnaiConnectionState.IDLE
-            and not self._thread_exit_flag
-        ):
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udpsock:
-                try:
-                    udpsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    udpsock.settimeout(self._udp_timeout_seconds)
-                    udpsock.bind((self._udp_address, self._udp_port))
-                    data, addr = udpsock.recvfrom(1024)
-                    if data.startswith(rinnai_broadcast_string):
-                        _LOGGER.debug("Broadcast data: %s", data.hex())
-                        if addr[0] == self._ip_address:
-                            _LOGGER.debug("Broadcast received from address: %s", addr[0])
-                            self._update_socket_state(RinnaiConnectionState.CONNECTING)
-                            continue
-                    # A broadcast from some other unit, or noise on the port, must
-                    # still count towards the fallback or discovery never ends.
-                    udp_timeout_count += 1
-                except TimeoutError:
-                    udp_timeout_count += 1
-                except OSError as e:
-                    _LOGGER.error("Unexpected broadcast error: %s", e)
-                    self._update_socket_state(RinnaiConnectionState.ERROR)
-                    continue
+        Falls back to a direct TCP attempt after enough timeouts or packets from other
+        units. Returns immediately on shutdown, thanks to the wake-up socket.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udpsock, (
+            selectors.DefaultSelector()
+        ) as selector:
+            try:
+                udpsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                udpsock.setblocking(False)
+                udpsock.bind((self._udp_address, self._udp_port))
+            except OSError as err:
+                _LOGGER.warning(
+                    "Cannot listen for the unit's broadcast (%s), connecting directly",
+                    err,
+                )
+                self._update_socket_state(RinnaiConnectionState.CONNECTING)
+                return
+            selector.register(udpsock, selectors.EVENT_READ)
+            selector.register(self._wake_receiver, selectors.EVENT_READ)
 
-                if udp_timeout_count < self._udp_fallback_attempts:
+            attempts = 0
+            while (
+                self._socketstate == RinnaiConnectionState.IDLE
+                and not self._thread_exit_flag
+            ):
+                ready = {
+                    key.fileobj for key, _ in selector.select(self._udp_timeout_seconds)
+                }
+                if self._wake_receiver in ready:
+                    self._drain_wake()
+                    if udpsock not in ready:
+                        continue
+                if udpsock in ready:
+                    try:
+                        data, addr = udpsock.recvfrom(1024)
+                    except OSError as err:
+                        _LOGGER.warning("Broadcast receive failed: %s", err)
+                        data, addr = b"", ("", 0)
+                    if data.startswith(_BROADCAST_PREFIX) and addr[0] == self._ip_address:
+                        _LOGGER.debug("Broadcast received from %s: %s", addr[0], data.hex())
+                        self._update_socket_state(RinnaiConnectionState.CONNECTING)
+                        return
+                # A timeout, or a packet from some other unit: both count, or discovery
+                # could wait forever on a network with two units.
+                attempts += 1
+                if attempts < self._udp_fallback_attempts:
                     _LOGGER.debug(
-                        "No broadcast received from the unit, retrying (%d/%d)",
-                        udp_timeout_count,
+                        "No broadcast from %s yet, retrying (%d/%d)",
+                        self._ip_address,
+                        attempts,
                         self._udp_fallback_attempts,
                     )
-                elif self._socketstate == RinnaiConnectionState.IDLE:
-                    _LOGGER.warning(
-                        "No UDP broadcast received after %d attempts, "
-                        "attempting TCP connection directly",
-                        udp_timeout_count,
-                    )
-                    self._update_socket_state(RinnaiConnectionState.CONNECTING)
+                    continue
+                _LOGGER.warning(
+                    "No broadcast from %s after %d timeouts or foreign packets, "
+                    "connecting directly",
+                    self._ip_address,
+                    attempts,
+                )
+                self._update_socket_state(RinnaiConnectionState.CONNECTING)
 
     def _create_socket_and_connect(self) -> None:
         self._wait_for_broadcast()
@@ -609,7 +663,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                 self._update_socket_state(RinnaiConnectionState.CONNECTED)
 
                 # Reset the timestamps and command sequence number
-                self._last_command_time = time.time()
+                self._last_command_time = time.monotonic()
                 self._last_received_time = self._last_command_time
                 self._command_sequence = 1
 
@@ -619,7 +673,7 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
             except ConnectionRefusedError:
                 self._update_socket_state(RinnaiConnectionState.REFUSED)
                 self._exit_event.wait(5)
-            except TimeoutError:
+            except _TIMEOUT_ERRORS:
                 self._update_socket_state(RinnaiConnectionState.TIMEOUT)
                 self._exit_event.wait(5)
             except (ConnectionError, BlockingIOError, InterruptedError):
@@ -628,5 +682,5 @@ class RinnaiPollConnection:  # pylint: disable=too-many-instance-attributes
                 self._exit_event.wait(10)
             except OSError as e:
                 self._update_socket_state(RinnaiConnectionState.ERROR)
-                _LOGGER.error('Unexpected connection error: "%s", will retry', e)
+                _LOGGER.warning('Unexpected connection error: "%s", will retry', e)
                 self._exit_event.wait(10)

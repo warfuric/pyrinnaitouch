@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -66,6 +67,7 @@ class RinnaiSystem:
     # pylint: disable=too-many-instance-attributes,too-many-public-methods
 
     instances = {}
+    _instances_lock = threading.Lock()
 
     def __init__(self, ip_address: str) -> None:
         self._receiverqueue = queue.SimpleQueue()
@@ -82,16 +84,18 @@ class RinnaiSystem:
     @staticmethod
     def get_instance(ip_address: str) -> Self:
         """Get a single instance of the system defined by its IP address."""
-        if ip_address in RinnaiSystem.instances:
-            return RinnaiSystem.instances[ip_address]
-        return RinnaiSystem(ip_address)
+        with RinnaiSystem._instances_lock:
+            if ip_address in RinnaiSystem.instances:
+                return RinnaiSystem.instances[ip_address]
+            return RinnaiSystem(ip_address)
 
     @staticmethod
     def remove_instance(ip_address: str) -> None:
         """Remove an instance of the system defined by its IP address."""
         # Drop the registration first so a failed shutdown can't leave a stale
         # instance that blocks every later reload.
-        system = RinnaiSystem.instances.pop(ip_address, None)
+        with RinnaiSystem._instances_lock:
+            system = RinnaiSystem.instances.pop(ip_address, None)
         if system is None:
             _LOGGER.warning("No instance found for IP: %s", ip_address)
             return

@@ -5,8 +5,8 @@ These exercise ``_process_received_data`` with an injected buffer (no sockets), 
 """
 
 import json
+import logging
 import socket
-import threading
 import time
 from queue import Empty, SimpleQueue
 
@@ -142,24 +142,94 @@ def test_truncated_message_is_abandoned_when_next_header_arrives(conn):
     assert conn._readbuffer == b""  # pylint: disable=protected-access
 
 
-def test_garbage_without_marker_is_bounded(conn):
+def test_oversized_incomplete_message_resets_connection(conn):
     conn, queue = conn
-    for _ in range(200):
-        feed(conn, b"N000001[" + b"x" * 1000)  # header never closes, no new header
-    assert len(conn._readbuffer) <= 70000  # pylint: disable=protected-access
+    feed(conn, b"N000001[")  # a header whose JSON never closes...
+    for chunks in range(1, 100):
+        feed(conn, b"x" * 1000)  # ...followed by nothing useful
+        if conn.socket_state() is RinnaiConnectionState.ERROR:
+            break
+    assert conn.socket_state() is RinnaiConnectionState.ERROR
+    assert 64 < chunks < 70  # tripped just past the 64 KiB cap, not before
+    assert conn._readbuffer == b""  # pylint: disable=protected-access
     assert drain(queue) == []
-    feed(conn, message(13))
-    # Once the sync point comes round the parser must be usable again.
-    assert json.loads(STATUS) in drain(queue) or conn._readbuffer != b""  # pylint: disable=protected-access
 
 
-def test_command_wait_is_cleared_by_matching_sequence(conn):
+def test_header_inside_json_string_is_not_a_resync_point(conn):
+    conn, queue = conn
+    payload = '[{"SYST": {"CFG": {"ZA": "N000002[room"}}}]'
+    data = message(1, payload)
+    cut = data.index(b"[room") + 3  # split inside the string, right after the fake header
+    feed(conn, data[:cut])
+    assert drain(queue) == []
+    feed(conn, data[cut:] + message(2))
+    assert drain(queue) == [json.loads(payload), json.loads(STATUS)]
+    assert conn._readbuffer == b""  # pylint: disable=protected-access
+
+
+def test_whitespace_between_frames_is_ignored(conn, caplog):
+    conn, queue = conn
+    caplog.set_level(logging.WARNING)
+    feed(conn, b"*HELLO*\r\n" + message(1) + b"\r\n" + message(2) + b"\n")
+    assert len(drain(queue)) == 2
+    assert conn._readbuffer == b""  # pylint: disable=protected-access
+    assert not caplog.records
+
+
+def test_watchdog_counts_parsed_frames_not_raw_bytes(conn):
+    conn, queue = conn
+    conn._last_received_time = 0.0  # pylint: disable=protected-access
+    feed(conn, b"\x00" * 20)  # noise must not keep the connection alive
+    assert conn._last_received_time == 0.0  # pylint: disable=protected-access
+    feed(conn, message(3))
+    assert conn._last_received_time > 0.0  # pylint: disable=protected-access
+    drain(queue)
+
+
+def test_command_wait_is_cleared_only_by_the_echoed_sequence(conn):
     conn, _ = conn
     conn._command_wait = True  # pylint: disable=protected-access
     conn._command_sequence = 20  # pylint: disable=protected-access
     feed(conn, message(19))
     assert conn._command_wait is True  # pylint: disable=protected-access
+    feed(conn, message(21))  # a higher number is not an acknowledgement either
+    assert conn._command_wait is True  # pylint: disable=protected-access
     feed(conn, message(20))
+    assert conn._command_wait is False  # pylint: disable=protected-access
+
+
+class _FakeSocket:
+    """Accepts every byte; enough for framing tests."""
+
+    def __init__(self):
+        self.sent = bytearray()
+
+    def send(self, data):
+        self.sent.extend(data)
+        return len(data)
+
+    def shutdown(self, _how):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_sequence_wraps_from_255_to_0(conn):
+    conn, _ = conn
+    conn._socket = _FakeSocket()  # pylint: disable=protected-access
+    conn._command_sequence = 254  # pylint: disable=protected-access
+    conn._last_received_sequence_num = 254  # pylint: disable=protected-access
+    conn._queue_frame(b"NA", "idle command")  # pylint: disable=protected-access
+    assert conn._command_sequence == 255  # pylint: disable=protected-access
+    feed(conn, message(255))
+    assert conn._command_wait is False  # pylint: disable=protected-access
+    conn._queue_frame(b"NA", "idle command")  # pylint: disable=protected-access
+    assert conn._command_sequence == 0  # pylint: disable=protected-access
+    assert conn._socket.sent.endswith(b"N000000NA")  # pylint: disable=protected-access
+    feed(conn, message(255))  # still echoing the previous command
+    assert conn._command_wait is True  # pylint: disable=protected-access
+    feed(conn, message(0))
     assert conn._command_wait is False  # pylint: disable=protected-access
 
 
@@ -192,8 +262,39 @@ def test_send_command_before_start_does_not_raise(conn):
     conn.send_command('{"SYST": {"OSS": {"MD": "H"}}}')
 
 
+def test_failed_construction_releases_the_client_slot(monkeypatch):
+    RinnaiPollConnection.clients.clear()
+
+    def no_fds():
+        raise OSError("Too many open files")
+
+    monkeypatch.setattr(socket, "socketpair", no_fds)
+    with pytest.raises(OSError):
+        RinnaiPollConnection("10.0.0.6", SimpleQueue())
+    assert RinnaiPollConnection.clients["10.0.0.6"] == 0
+    monkeypatch.undo()
+    conn = RinnaiPollConnection("10.0.0.6", SimpleQueue())  # slot is free again
+    conn.stop_thread()
+    RinnaiPollConnection.clients.clear()
+
+
+def test_state_handler_exception_does_not_reach_the_caller(conn, caplog):
+    conn, _ = conn
+    caplog.set_level(logging.ERROR)
+    conn.register_socket_state_handler(lambda state: 1 / 0)  # raises immediately
+    assert "Socket state handler" in caplog.text
+    conn._update_socket_state(RinnaiConnectionState.CONNECTING)  # pylint: disable=protected-access
+
+
 def _free_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _closed_tcp_port() -> int:
+    """A port nothing listens on, so a connect is refused rather than answered."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
@@ -210,7 +311,7 @@ def test_thread_is_daemon_and_stops_promptly_while_connecting():
     started = time.monotonic()
     conn.stop_thread()  # must not raise even though the thread is mid-wait
     assert not thread.is_alive(), "thread still alive after stop_thread"
-    assert time.monotonic() - started < 8
+    assert time.monotonic() - started < 2  # the wake socket interrupts discovery
     assert RinnaiPollConnection.clients["127.0.0.1"] == 0
     assert "sys.exit" in drain(queue)
     RinnaiPollConnection.clients.clear()
@@ -219,7 +320,9 @@ def test_thread_is_daemon_and_stops_promptly_while_connecting():
 def test_stop_thread_from_stale_state_after_connect_refused():
     """A refused TCP connect (no unit listening) must keep retrying, then stop cleanly."""
     RinnaiPollConnection.clients.clear()
-    conn = RinnaiPollConnection("127.0.0.1", SimpleQueue(), udp_port=_free_udp_port())
+    conn = RinnaiPollConnection(
+        "127.0.0.1", SimpleQueue(), udp_port=_free_udp_port(), tcp_port=_closed_tcp_port()
+    )
     conn._socketstate = RinnaiConnectionState.TIMEOUT  # skip discovery, go straight to TCP  # pylint: disable=protected-access
     conn.start_thread()
     deadline = time.monotonic() + 5
