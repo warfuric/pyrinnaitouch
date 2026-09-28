@@ -1,19 +1,14 @@
 """Main system control"""
 
+from __future__ import annotations
+
+import asyncio
 import logging
-import queue
-import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, Dict, Optional
 
 from .const import RinnaiSystemMode, RinnaiUnitId
-
-try:
-    from typing import Self
-except ImportError:
-    from typing_extensions import Self
-
-from .pollconnection import RinnaiPollConnection
+from .connection import RinnaiConnection, RinnaiConnectionState, wait_or_timeout
 from .event import Event
 from .system_status import RinnaiSystemStatus
 from .commands import (
@@ -56,51 +51,80 @@ from .commands import (
     UNIT_ZONE_SET_TEMP,
 )
 
-from .util import daemonthreaded
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class RinnaiSystem:
-    """Main controller class to interact with the Rinnai Touch Wifi unit."""
+    """Main controller class to interact with the Rinnai Touch Wifi unit.
+
+    Create it inside a running event loop, ``await async_start()``, and read
+    ``get_stored_status()`` whenever an update callback fires. Every callback runs on
+    the event loop.
+    """
 
     # pylint: disable=too-many-instance-attributes,too-many-public-methods
 
-    instances = {}
-    _instances_lock = threading.Lock()
+    instances: Dict[str, "RinnaiSystem"] = {}
 
-    def __init__(self, ip_address: str) -> None:
-        self._receiverqueue = queue.SimpleQueue()
-        self._connection = RinnaiPollConnection(ip_address, self._receiverqueue)
-        self._lastupdated = 0
+    def __init__(self, ip_address: str, **connection_options: Any) -> None:
+        self._ip_address = ip_address
+        self._connection = RinnaiConnection(
+            ip_address, self._handle_status_message, **connection_options
+        )
         self._status = RinnaiSystemStatus()
-        self._nosendupdates = 0
-        RinnaiSystem.instances[ip_address] = self
+        self._have_status = False
+        self._status_event: Optional[asyncio.Event] = None
         self._on_updated = Event()
+        self._connection.register_state_handler(self._handle_connection_state)
 
-        # Start the thread
-        self.poll_loop()
+    @classmethod
+    def get_instance(cls, ip_address: str, **connection_options: Any) -> "RinnaiSystem":
+        """Get the single instance for a unit, creating it on first use."""
+        system = cls.instances.get(ip_address)
+        if system is None:
+            system = cls.instances[ip_address] = cls(ip_address, **connection_options)
+        return system
 
-    @staticmethod
-    def get_instance(ip_address: str) -> Self:
-        """Get a single instance of the system defined by its IP address."""
-        with RinnaiSystem._instances_lock:
-            if ip_address in RinnaiSystem.instances:
-                return RinnaiSystem.instances[ip_address]
-            return RinnaiSystem(ip_address)
-
-    @staticmethod
-    def remove_instance(ip_address: str) -> None:
-        """Remove an instance of the system defined by its IP address."""
-        # Drop the registration first so a failed shutdown can't leave a stale
-        # instance that blocks every later reload.
-        with RinnaiSystem._instances_lock:
-            system = RinnaiSystem.instances.pop(ip_address, None)
+    @classmethod
+    async def async_remove_instance(cls, ip_address: str) -> None:
+        """Stop and forget the instance for a unit."""
+        system = cls.instances.pop(ip_address, None)
         if system is None:
             _LOGGER.warning("No instance found for IP: %s", ip_address)
             return
-        system.shutdown()
+        await system.async_stop()
         _LOGGER.debug("Removed instance for IP: %s", ip_address)
+
+    # ------------------------------------------------------------- lifecycle
+
+    async def async_start(self) -> None:
+        """Start connecting to the unit and keep the connection up. Idempotent."""
+        if self._status_event is None:
+            self._status_event = asyncio.Event()
+        await self._connection.start()
+
+    async def async_stop(self) -> None:
+        """Disconnect from the unit and stop reconnecting. Idempotent."""
+        await self._connection.stop()
+
+    async def async_wait_ready(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the first status from the unit."""
+        if self._have_status:
+            return True
+        if self._status_event is None:
+            return False
+        ready, _ = await wait_or_timeout(self._status_event.wait(), timeout)
+        return ready
+
+    @property
+    def is_connected(self) -> bool:
+        """True while the TCP session to the unit is up."""
+        return self._connection.is_connected
+
+    def socket_state(self) -> RinnaiConnectionState:
+        """Current connection state."""
+        return self._connection.state
 
     def subscribe_updates(self, obj_method: Any) -> None:
         """Subscribe to updates when the system status refreshes."""
@@ -110,28 +134,28 @@ class RinnaiSystem:
         """Unsubscribe from updates received when the system status refreshes."""
         self._on_updated -= obj_method
 
-    @daemonthreaded
-    def poll_loop(self) -> None:
-        """Main poll thread to receive updated messages from the unit."""
+    def register_socket_state_handler(self, socket_handler: Any) -> None:
+        """Register a socket state handler to receive updates."""
+        self._connection.register_state_handler(socket_handler)
 
-        # enter loop, wait for received (new) messages and push them to hass
-        while True:
-            new_status_json = self._receiverqueue.get()
-            if isinstance(new_status_json, str):
-                if new_status_json == "sys.exit":
-                    break
-                continue
-            if not new_status_json:
-                continue
-            # Nothing may end this thread: nobody restarts it.
-            try:
-                self._handle_status_message(new_status_json)
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Error handling a status update, skipping it")
-        _LOGGER.debug("Shutting down the polling thread")
+    def unregister_socket_state_handler(self, socket_handler: Any) -> None:
+        """Unregister a socket state handler."""
+        self._connection.unregister_state_handler(socket_handler)
+
+    # --------------------------------------------------------- incoming data
+
+    def _handle_connection_state(self, state: RinnaiConnectionState) -> None:
+        if state is RinnaiConnectionState.CONNECTED or not self._have_status:
+            return
+        # The unit is gone: stop reporting its last status as if it were live.
+        self._have_status = False
+        self._status = RinnaiSystemStatus()
+        self._on_updated()
 
     def _handle_status_message(self, new_status_json: Any) -> None:
         """Turn one decoded status message into a status object and notify."""
+        if not new_status_json:
+            return
         if (
             isinstance(new_status_json, list)
             and isinstance(new_status_json[0], dict)
@@ -143,11 +167,16 @@ class RinnaiSystem:
             return
 
         status = RinnaiSystemStatus()
-        if status.handle_status(new_status_json):
-            self._status = status
-            self._on_updated()
-        else:
+        if not status.handle_status(new_status_json):
             _LOGGER.error("JSON Error: %s", new_status_json)
+            return
+        self._status = status
+        self._have_status = True
+        if self._status_event is not None:
+            self._status_event.set()
+        self._on_updated()
+
+    # --------------------------------------------------------------- commands
 
     async def set_cooling_mode(self) -> bool:
         """Set system to cooling mode."""
@@ -421,7 +450,7 @@ class RinnaiSystem:
         return self._status
 
     def validate_command(self, cmd: str) -> bool:
-        """Validate a command is appropriat to the current operating mode."""
+        """Validate a command is appropriate to the current operating mode."""
         if cmd in MODE_COMMANDS:
             return True
         if cmd in UNIT_COMMANDS and self._status.mode in (
@@ -448,29 +477,3 @@ class RinnaiSystem:
             self._status.mode,
         )
         return False
-
-    def register_socket_state_handler(self, socket_handler: Any) -> None:
-        """Register a socket state handler to receive updates."""
-        self._connection.register_socket_state_handler(socket_handler)
-
-    def unregister_socket_state_handler(self, socket_handler: Any) -> None:
-        """Unregister a socket state handler."""
-        self._connection.unregister_socket_state_handler(socket_handler)
-
-    def get_status(self) -> RinnaiSystemStatus:
-        """Retrieve (initially empty) status from the unit."""
-        self._connection.start_thread()
-        return self._status
-
-    def shutdown(self, *_args: Any) -> None:
-        """Call this when removing the integration from home assistant.
-
-        Extra positional arguments are accepted and ignored so this can be
-        registered directly as a Home Assistant event listener, which passes the
-        Event through.
-        """
-        try:
-            self._connection.stop_thread()
-            _LOGGER.debug("Connection thread stopped")
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Error stopping the connection thread")

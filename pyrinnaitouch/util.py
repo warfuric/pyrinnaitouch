@@ -1,6 +1,5 @@
 """Utility functions"""
-import threading
-from typing import Any, Callable
+from typing import Any
 from .const import RinnaiSchedulePeriod
 
 def get_attribute(data: Any, attribute: str, default_value: Any) -> Any:
@@ -26,17 +25,6 @@ def symbol_to_schedule_period(symbol: str) -> RinnaiSchedulePeriod:
     if symbol == "S":
         return RinnaiSchedulePeriod.SLEEP
     return RinnaiSchedulePeriod.NONE
-
-def daemonthreaded(function_arg: Callable) -> Callable:
-    """Decoration to start object function as thread"""
-    def wrapper(*args, **kwargs) -> threading.Thread:
-        thread = threading.Thread(
-            target=function_arg, args=args, kwargs=kwargs, name=function_arg.__qualname__
-        )
-        thread.daemon = True
-        thread.start()
-        return thread
-    return wrapper
 
 class UnknownModeException(Exception):
     """Exception to catch system being in an unknown mode"""

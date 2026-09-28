@@ -1,10 +1,7 @@
 """Module to capture event handling"""
 import logging
 
-try:
-    from typing import Self
-except ImportError:
-    from typing_extensions import Self
+from typing import Self
 
 _LOGGER = logging.getLogger(__name__)
 

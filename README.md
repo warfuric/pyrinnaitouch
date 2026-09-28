@@ -1,20 +1,40 @@
+# pyrinnaitouch
 
-# pyrinnaitouch - python interface to Rinnai Touch Wifi Controllers
+A Python interface to the Rinnai Touch / Brivis Touch wifi controller (NBW2 module),
+written for the Home Assistant integration but usable on its own.
 
-![Pylint](https://github.com/funtastix/pyrinnaitouch/workflows/Pylint/badge.svg)
+The library is asyncio based. One task per unit keeps the connection up: it waits for
+the unit's UDP broadcast, opens the TCP session, reads status frames, paces commands by
+the unit's acknowledgement, sends a keep-alive when idle and reconnects on any
+failure. Every callback runs on the event loop.
 
-This is a python interface to the [Rinnai Touch Wifi Controller](https://www.rinnai.com.au/online/controllers/heating-and-cooling-controllers/rinnai-touch-wi-fi/).
+```python
+import asyncio
+from pyrinnaitouch import RinnaiSystem
 
-The specifications for the interface are contained in the [included pdf](./NBW2API_Iss1.3.pdf).
+async def main():
+    system = RinnaiSystem("192.168.1.50")
+    system.subscribe_updates(lambda: print(system.get_stored_status().mode))
+    await system.async_start()
+    if not await system.async_wait_ready(40):
+        raise SystemExit("unit not reachable")
+    await system.set_unit_temp(22)
+    await asyncio.sleep(5)
+    await system.async_stop()
 
-## Usage
+asyncio.run(main())
+```
 
-This package is not a standalone application for end user implementation.
+The unit accepts a single client, so create one `RinnaiSystem` per unit
+(`RinnaiSystem.get_instance(ip)` keeps a registry) and stop it before the app exits.
 
-The aim of this package is to be used by software developers and integrators to implement
-the Rinnai Touch Wifi interface on home automation platforms (principally Home Assistant )
+`pyrinnaitouch.simulator.FakeRinnaiUnit` is an in-process stand-in for the module,
+enough to develop and test a client without the hardware.
 
-## Credit
+## Development
 
-The [pescea interface](https://github.com/lazdavila/pescea) was used as a template and
-for inspiration in developing this library (which got it off to a good start, so thanks!)
+```
+pip install -r requirements_dev.txt
+python -m pytest
+pylint pyrinnaitouch
+```
