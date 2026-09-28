@@ -24,8 +24,7 @@ setup(
     python_requires=">=3.9",
     tests_require=["pytest"],
     install_requires=[
-        "asyncio",
-        "async_timeout",
+        'typing_extensions; python_version < "3.11"',
     ],
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -34,7 +33,10 @@ setup(
         "Topic :: System :: Hardware",
         "Operating System :: OS Independent",
         "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
 )
