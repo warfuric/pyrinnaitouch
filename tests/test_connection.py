@@ -280,7 +280,10 @@ async def test_sender_failure_ends_the_session_and_reconnects(unit):
 
     client.conn._writer.write = broken_write  # pylint: disable=protected-access
     client.conn.send_command('{"a": 1}')
+    await wait_for(lambda: RinnaiConnectionState.ERROR in client.states, what="session ended")
+    failed_at = time.monotonic()
     await wait_for(lambda: unit.connections == 2 and client.conn.is_connected, what="reconnect")
+    assert time.monotonic() - failed_at >= 0.15  # a socket fault waits retry_delay (0.2 s)
     client.conn.send_command('{"b": 2}')
     await wait_for(lambda: any(payload == '{"b": 2}' for _, payload in unit.commands))
     await client.conn.stop()
@@ -317,3 +320,39 @@ async def test_keepalive_prevents_the_units_idle_drop():
         await silent.conn.stop()
     finally:
         await unit.stop()
+
+
+async def test_alias_of_a_live_unit_is_refused(unit):
+    first = Client(unit)
+    await first.conn.start()
+    alias = RinnaiConnection("localhost", lambda s: None, tcp_port=unit.tcp_port,
+                             udp_port=unit.udp_port, **FAST)  # resolves to 127.0.0.1
+    _OPEN_CONNECTIONS.append(alias)
+    with pytest.raises(RuntimeError):
+        await alias.start()
+    await first.conn.stop()
+
+
+async def test_sequence_continues_from_the_units_counter_and_wraps(unit):
+    unit._last_sequence = 254  # pylint: disable=protected-access
+    client = Client(unit)
+    await client.conn.start()
+    assert await client.conn.wait_connected(3)
+    await wait_for(lambda: client.statuses, what="first status")
+    client.conn.send_command('{"a": 1}')
+    client.conn.send_command('{"b": 2}')
+    await wait_for(lambda: len([c for c in unit.commands if c[1] != "NA"]) == 2)
+    assert [seq for seq, payload in unit.commands if payload != "NA"] == [255, 0]
+    await client.conn.stop()
+
+
+async def test_second_tcp_client_is_dropped_by_the_unit(unit):
+    """The simulator, like the hardware, serves one client at a time."""
+    client = Client(unit)
+    await client.conn.start()
+    assert await client.conn.wait_connected(3)
+    reader, writer = await asyncio.open_connection(unit.host, unit.tcp_port)
+    assert await reader.read(100) == b""  # closed straight away, no hello
+    writer.close()
+    assert unit.refused == 1 and unit.connections == 1
+    await client.conn.stop()

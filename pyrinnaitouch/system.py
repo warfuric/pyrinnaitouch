@@ -102,6 +102,8 @@ class RinnaiSystem:
         """Start connecting to the unit and keep the connection up. Idempotent."""
         if self._status_event is None:
             self._status_event = asyncio.Event()
+        if not self._have_status:
+            self._status_event.clear()
         await self._connection.start()
 
     async def async_stop(self) -> None:
@@ -154,6 +156,8 @@ class RinnaiSystem:
         # The unit is gone: stop reporting its last status as if it were live.
         self._have_status = False
         self._status = RinnaiSystemStatus()
+        if self._status_event is not None:
+            self._status_event.clear()
         self._on_updated()
 
     def _handle_status_message(self, new_status_json: Any) -> None:
@@ -466,9 +470,10 @@ class RinnaiSystem:
             return True
         return False
 
-    def send_command(self, cmd: str) -> None:
-        """Send the command to the unit."""
+    def send_command(self, cmd: str) -> bool:
+        """Queue the command for the unit; returns True once queued."""
         self._connection.send_command(cmd)
+        return True
 
     def validate_and_send(self, cmd: str) -> bool:
         """Validate and send a command."""

@@ -73,6 +73,7 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
         self.hello = True
         self.commands: List[Tuple[int, str]] = []
         self.connections = 0
+        self.refused = 0
 
         self._server: Optional[asyncio.AbstractServer] = None
         self._broadcaster: Optional[asyncio.Task] = None
@@ -135,6 +136,11 @@ class FakeRinnaiUnit:  # pylint: disable=too-many-instance-attributes
                 await asyncio.sleep(self.broadcast_interval)
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._clients:
+            # The real module serves one client; a second one is simply dropped.
+            self.refused += 1
+            writer.close()
+            return
         self.connections += 1
         self._clients.append(writer)
         if self.hello:
